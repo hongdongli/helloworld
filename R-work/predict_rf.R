@@ -27,9 +27,10 @@ if (!file.exists(model_file))
 bundle <- readRDS(model_file)
 
 # Loading the engine's namespace is what registers its predict() method.
-if (!requireNamespace(bundle$engine, quietly = TRUE))
-  stop("This model was fitted with '", bundle$engine, "', which is not ",
-       "installed here. Install it with: install.packages('", bundle$engine, "')")
+.pkg <- rf_engine_pkg(bundle$engine)
+if (!requireNamespace(.pkg, quietly = TRUE))
+  stop("This model was fitted with '", bundle$engine, "', which needs package '",
+       .pkg, "'. Install it with: install.packages('", .pkg, "')")
 
 recipe <- bundle$recipe
 target <- recipe$target
@@ -41,7 +42,7 @@ cat("model      :", model_file, sprintf("(%s, %d trees, trained on %s / %d rows)
                                         bundle$trained_on, bundle$n_train))
 cat("input      :", in_file, "\n")
 
-raw <- rf_read_csv(in_file)
+raw <- rf_read_table(in_file)
 cat("rows       :", nrow(raw), "\n")
 
 extra <- setdiff(names(raw), c(recipe$predictors, target))
@@ -51,6 +52,9 @@ if (length(extra))
 prep <- rf_apply_recipe(raw, recipe)
 newx <- prep$data
 
+if (prep$na_kept > 0)
+  cat("missing    :", prep$na_kept,
+      "categorical value(s) kept as their own '(missing)' level\n")
 if (prep$imputed > 0)
   cat("imputed    :", prep$imputed,
       "missing predictor value(s) using training-set fill values\n")
@@ -66,7 +70,11 @@ if (length(prep$unseen)) {
 }
 cat("\n")
 
-if (bundle$engine == "ranger") {
+if (bundle$engine == "cforest") {
+  pred <- predict(bundle$fit, newdata = newx, type = "response")
+  prob <- if (is_classification)
+    rf_bind_probs(predict(bundle$fit, newdata = newx, type = "prob"), recipe$y_levels)
+} else if (bundle$engine == "ranger") {
   pred <- predict(bundle$fit, data = newx)$predictions
   prob <- if (is_classification) predict(bundle$prob_fit, data = newx)$predictions
 } else {
@@ -90,11 +98,14 @@ if (target %in% names(raw)) {
     if (is_classification) {
       cm <- table(predicted = out$prediction[known],
                   actual    = as.character(actual)[known])
-      cat("---- confusion matrix on held-out data (predicted vs actual) ----\n")
+      cat("---- confusion matrix (predicted vs actual) ----\n")
       print(cm)
       acc <- sum(diag(cm)) / sum(cm)
       cat(sprintf("accuracy: %.2f%% (%d of %d rows)\n",
                   100 * acc, sum(diag(cm)), sum(cm)))
+      cat("(An honest estimate only if these rows were not used for training.\n",
+          " Re-scoring the training file reproduces its optimistic in-sample\n",
+          " number -- compare against the out-of-bag figure from train_rf.R.)\n", sep = "")
       out$correct <- out$prediction == as.character(actual)
     } else {
       a   <- as.numeric(actual)[known]

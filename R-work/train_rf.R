@@ -19,7 +19,7 @@ args       <- commandArgs(trailingOnly = TRUE)
 in_file    <- if (length(args) >= 1) args[1] else "testdata.csv"
 out_file   <- if (length(args) >= 2) args[2] else "predictions.csv"
 model_file <- if (length(args) >= 3) args[3] else "rf_model.rds"
-target     <- "satisfied"
+target     <- Sys.getenv("RF_TARGET", "Satisfied")
 SEED       <- 42
 NTREE      <- 1000
 
@@ -30,11 +30,13 @@ cat("== Random forest on", target, "==\n")
 cat("engine     :", engine, "\n")
 cat("input      :", in_file, "\n\n")
 
-raw <- rf_read_csv(in_file)
+raw <- rf_read_table(in_file)
 cat("rows       :", nrow(raw), "\n")
 cat("columns    :", ncol(raw), "\n\n")
 
-recipe <- rf_build_recipe(raw, target)
+recipe <- rf_build_recipe(raw, target,
+                          na_as_level = Sys.getenv("RF_NA_LEVEL", "1") != "0")
+target <- recipe$target   # resolved to the file's actual capitalisation
 
 if (length(recipe$dropped_id))
   cat("dropping id-like columns:",
@@ -42,7 +44,12 @@ if (length(recipe$dropped_id))
 if (length(recipe$dropped_constant))
   cat("dropping constant columns:",
       paste(recipe$dropped_constant, collapse = ", "), "\n")
-if (length(c(recipe$dropped_id, recipe$dropped_constant))) cat("\n")
+if (length(recipe$dropped_redundant))
+  for (i in seq_along(recipe$dropped_redundant))
+    cat("dropping redundant column: ", recipe$dropped_redundant[i],
+        " (encodes the same variable as ", recipe$redundant_with[i], ")\n", sep = "")
+if (length(c(recipe$dropped_id, recipe$dropped_constant,
+              recipe$dropped_redundant))) cat("\n")
 
 if (!length(recipe$predictors))
   stop("No usable predictor columns left after dropping id and constant columns.")
@@ -60,6 +67,9 @@ if (is_classification) {
 cat("\n")
 
 prep <- rf_apply_recipe(raw, recipe)
+if (prep$na_kept > 0)
+  cat("missing    :", prep$na_kept,
+      "categorical value(s) kept as their own '(missing)' level\n")
 if (prep$imputed > 0)
   cat("imputed    :", prep$imputed, "missing predictor value(s)\n")
 
@@ -85,7 +95,35 @@ mtry <- max(1L, if (is_classification) floor(sqrt(p)) else floor(p / 3))
 fml  <- as.formula(paste(target, "~ ."))
 
 prob_fit <- NULL
-if (engine == "ranger") {
+prob_in  <- NULL   # stay NULL for regression, where there are no class probabilities
+prob_oob <- NULL
+newx <- model_data[, recipe$predictors, drop = FALSE]
+
+if (engine == "cforest") {
+  # cforest_unbiased() is the whole point of using party: subsampling without
+  # replacement plus unbiased split selection, so importance is not inflated
+  # for predictors that simply have more categories.
+  fit <- party::cforest(fml, data = train,
+                        controls = party::cforest_unbiased(ntree = NTREE, mtry = mtry))
+
+  pred_oob <- predict(fit, OOB = TRUE, type = "response")
+  pred_in  <- predict(fit, newdata = newx, type = "response")
+  oob_err  <- if (is_classification)
+    mean(pred_oob != train[[target]]) else mean((as.numeric(pred_oob) - train[[target]])^2)
+
+  if (is_classification) {
+    prob_in  <- rf_bind_probs(predict(fit, newdata = newx, type = "prob"), recipe$y_levels)
+    prob_oob <- rf_bind_probs(predict(fit, OOB = TRUE, type = "prob"), recipe$y_levels)
+  }
+
+  # conditional = TRUE accounts for correlation between predictors, but costs
+  # roughly a minute per hundred rows here. Off unless asked for.
+  conditional <- identical(Sys.getenv("RF_VARIMP"), "conditional")
+  if (conditional) cat("\ncomputing conditional variable importance (slow)...\n")
+  imp <- sort(party::varimp(fit, conditional = conditional), decreasing = TRUE)
+  attr(imp, "conditional") <- conditional
+
+} else if (engine == "ranger") {
   fit <- ranger::ranger(fml, data = train, num.trees = NTREE, mtry = mtry,
                         importance = "permutation", seed = SEED)
   # A separate probability forest gives calibrated class probabilities.
@@ -95,9 +133,9 @@ if (engine == "ranger") {
 
   oob_err  <- fit$prediction.error
   imp      <- sort(ranger::importance(fit), decreasing = TRUE)
-  pred_in  <- predict(fit, data = model_data)$predictions
+  pred_in  <- predict(fit, data = newx)$predictions
   pred_oob <- fit$predictions
-  prob_in  <- if (is_classification) predict(prob_fit, data = model_data)$predictions
+  prob_in  <- if (is_classification) predict(prob_fit, data = newx)$predictions
   prob_oob <- if (is_classification) prob_fit$predictions
 } else {
   fit <- randomForest::randomForest(fml, data = train, ntree = NTREE,
@@ -105,9 +143,9 @@ if (engine == "ranger") {
   oob_err  <- if (is_classification)
     mean(fit$predicted != train[[target]], na.rm = TRUE) else fit$mse[NTREE]
   imp      <- sort(randomForest::importance(fit)[, 1], decreasing = TRUE)
-  pred_in  <- predict(fit, newdata = model_data)
+  pred_in  <- predict(fit, newdata = newx)
   pred_oob <- fit$predicted
-  prob_in  <- if (is_classification) predict(fit, newdata = model_data, type = "prob")
+  prob_in  <- if (is_classification) predict(fit, newdata = newx, type = "prob")
   prob_oob <- if (is_classification) fit$votes
 }
 
@@ -122,8 +160,11 @@ if (is_classification) {
       sprintf("(RMSE %.4f)\n", sqrt(oob_err)))
 }
 
-cat("\n---- variable importance ----\n")
-print(round(imp, 5))
+cat("\n---- variable importance (",
+    if (isTRUE(attr(imp, "conditional"))) "conditional permutation" else
+      if (engine == "cforest") "permutation, unbiased" else "permutation",
+    ") ----\n", sep = "")
+print(round(setNames(as.numeric(imp), names(imp)), 5))
 
 # OOB results only exist for trained rows; pad back out to the full frame.
 expand <- function(v) {
@@ -152,6 +193,9 @@ if (is_classification) {
   cat("\n---- out-of-bag confusion matrix (predicted vs actual) ----\n")
   print(cm_oob)
   cat(sprintf("out-of-bag accuracy: %.2f%%\n", 100 * sum(diag(cm_oob)) / sum(cm_oob)))
+  base <- max(table(y[train_rows])) / sum(train_rows)
+  cat(sprintf("majority-class baseline: %.2f%% (always predict '%s')\n",
+              100 * base, names(which.max(table(y[train_rows])))))
   cat("\nIn-sample accuracy is optimistic -- every row helped grow most of\n",
       "the trees that score it. Judge the model by the out-of-bag numbers.\n", sep = "")
 } else {
